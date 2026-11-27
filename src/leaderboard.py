@@ -852,7 +852,7 @@ class LeaderboardDB:
         # Calculate average placement (skip for CN)
         avg_placement_str = ""
         if not is_cn:
-            avg_placement = calculate_average_placement(ratings)
+            avg_placement = calculate_average_placement(ratings, timestamps)
             avg_placement_str = (
                 f" with {avg_placement:.2f} average"
                 if not math.isnan(avg_placement)
@@ -931,7 +931,7 @@ class LeaderboardDB:
             elif use_placements:
                 # Non-CN: show placements (after cutoff date)
                 # Calculate placements for all rating changes
-                placements = calculate_placements(ratings)
+                placements = calculate_placements(ratings, timestamps)
 
                 # Filter to only show placements where rating changed
                 placements_with_changes = []

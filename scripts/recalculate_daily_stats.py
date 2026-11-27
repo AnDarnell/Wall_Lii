@@ -29,6 +29,12 @@ DAILY_LEADERBOARD_STATS = "daily_leaderboard_stats"
 LEADERBOARD_SNAPSHOTS = "leaderboard_snapshots"
 PLAYERS_TABLE = "players"
 
+# Dynamic rating cap for estimate_placement (keep in sync with config.py: RATING_CAP_*)
+RATING_CAP_SEASON_START = "2026-08-05 00:00:00+00"  # UTC
+RATING_CAP_START = 8500
+RATING_CAP_STEP_PER_DAY = 50
+RATING_CAP_MAX = 12500
+
 
 def get_player_id(cursor, player_name):
     """Fetch player_id for a given player_name."""
@@ -99,6 +105,84 @@ def ensure_estimate_placement_function(cursor):
         """
     )
     print("✓ estimate_placement function created/updated with 10000 threshold")
+
+
+def ensure_dynamic_estimate_placement_function(cursor):
+    """Create or replace the 3-argument estimate_placement (dynamic rating cap).
+
+    The 2-argument version from ensure_estimate_placement_function is left untouched.
+    """
+    cursor.execute(
+        f"""
+        CREATE OR REPLACE FUNCTION estimate_placement(
+            start_rating NUMERIC,
+            end_rating NUMERIC,
+            observed_at TIMESTAMPTZ
+        )
+        RETURNS NUMERIC
+        LANGUAGE plpgsql
+        STABLE
+        AS $$
+        DECLARE
+            gain NUMERIC;
+            dex_avg NUMERIC;
+            rating_cap NUMERIC;
+            placements NUMERIC[] := ARRAY[1, 2, 3, 3.5, 4, 4.5, 5, 5.5, 6, 6.5, 7, 7.5, 8];
+            p NUMERIC;
+            avg_opp NUMERIC;
+            delta NUMERIC;
+            best_placement NUMERIC := 1;
+            best_delta NUMERIC := 'Infinity'::NUMERIC;
+        BEGIN
+            gain := end_rating - start_rating;
+
+            -- Dynamic rating cap: grows in whole steps per full day since season start.
+            -- Missing time falls back to now().
+            rating_cap := LEAST(
+                {RATING_CAP_MAX},
+                {RATING_CAP_START} + {RATING_CAP_STEP_PER_DAY} * GREATEST(
+                    0,
+                    FLOOR(
+                        EXTRACT(EPOCH FROM (
+                            COALESCE(observed_at, now())
+                            - TIMESTAMPTZ '{RATING_CAP_SEASON_START}'
+                        )) / 86400
+                    )
+                )
+            );
+
+            -- Calculate dexAvg
+            IF start_rating < 8200 THEN
+                dex_avg := start_rating;
+            ELSE
+                dex_avg := start_rating - 0.85 * (start_rating - 8500);
+            END IF;
+
+            -- Find placement with smallest delta
+            FOREACH p IN ARRAY placements
+            LOOP
+                -- avgOpp-formula
+                avg_opp := start_rating - 148.1181435 * (100 - ((p - 1) * (200.0 / 7.0) + gain));
+
+                -- Skip placements where avg_opp > dynamic rating cap
+                IF avg_opp > rating_cap THEN
+                    CONTINUE;
+                END IF;
+
+                delta := ABS(dex_avg - avg_opp);
+
+                IF delta < best_delta THEN
+                    best_delta := delta;
+                    best_placement := p;
+                END IF;
+            END LOOP;
+
+            RETURN best_placement;
+        END;
+        $$;
+        """
+    )
+    print("✓ estimate_placement (3-argument, dynamic rating cap) created/updated")
 
 
 def recalculate_averages_batch(
@@ -179,7 +263,7 @@ def recalculate_averages_batch(
                 day_start_pt,
                 prev_rating,
                 rating,
-                estimate_placement(prev_rating, rating) AS placement,
+                estimate_placement(prev_rating, rating, snapshot_time) AS placement,
                 -- Calculate week_start for each rating change
                 day_start_pt - EXTRACT(DOW FROM day_start_pt)::integer 
                     + CASE WHEN EXTRACT(DOW FROM day_start_pt) = 0 THEN -6 ELSE 1 END AS week_start
@@ -289,7 +373,7 @@ def recalculate_averages_batch(
                     day_start_pt,
                     prev_rating,
                     rating,
-                    estimate_placement(prev_rating, rating) AS placement,
+                    estimate_placement(prev_rating, rating, snapshot_time) AS placement,
                     day_start_pt - EXTRACT(DOW FROM day_start_pt)::integer 
                         + CASE WHEN EXTRACT(DOW FROM day_start_pt) = 0 THEN -6 ELSE 1 END AS week_start
                 FROM all_snapshots
@@ -480,6 +564,7 @@ def main():
 
         # Ensure estimate_placement function exists with 10000 threshold
         ensure_estimate_placement_function(cursor)
+        ensure_dynamic_estimate_placement_function(cursor)
         conn.commit()
 
         # Handle test configuration

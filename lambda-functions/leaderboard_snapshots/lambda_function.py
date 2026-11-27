@@ -21,6 +21,12 @@ MILESTONE_TRACKING = "milestone_tracking"
 DAILY_LEADERBOARD_STATS = "daily_leaderboard_stats"
 PLAYERS_TABLE = "players"
 
+# Dynamic rating cap for estimate_placement (keep in sync with config.py: RATING_CAP_*)
+RATING_CAP_SEASON_START = "2026-08-05 00:00:00+00"  # UTC
+RATING_CAP_START = 8500
+RATING_CAP_STEP_PER_DAY = 50
+RATING_CAP_MAX = 12500
+
 # Configs
 REGIONS = ["US", "EU", "AP"]
 MODES = [("battlegrounds", 0), ("battlegroundsduo", 1)]
@@ -342,6 +348,79 @@ def write_to_postgres(players):
                 """
                 )
 
+                # Add an overload with a time argument that applies the dynamic rating cap.
+                # The 2-argument version above is left untouched.
+                cur.execute(
+                    f"""
+                    CREATE OR REPLACE FUNCTION estimate_placement(
+                        start_rating NUMERIC,
+                        end_rating NUMERIC,
+                        observed_at TIMESTAMPTZ
+                    )
+                    RETURNS NUMERIC
+                    LANGUAGE plpgsql
+                    STABLE
+                    AS $$
+                    DECLARE
+                        gain NUMERIC;
+                        dex_avg NUMERIC;
+                        rating_cap NUMERIC;
+                        placements NUMERIC[] := ARRAY[1, 2, 3, 3.5, 4, 4.5, 5, 5.5, 6, 6.5, 7, 7.5, 8];
+                        p NUMERIC;
+                        avg_opp NUMERIC;
+                        delta NUMERIC;
+                        best_placement NUMERIC := 1;
+                        best_delta NUMERIC := 'Infinity'::NUMERIC;
+                    BEGIN
+                        gain := end_rating - start_rating;
+
+                        -- Dynamic rating cap: grows in whole steps per full day since season start.
+                        -- Missing time falls back to now().
+                        rating_cap := LEAST(
+                            {RATING_CAP_MAX},
+                            {RATING_CAP_START} + {RATING_CAP_STEP_PER_DAY} * GREATEST(
+                                0,
+                                FLOOR(
+                                    EXTRACT(EPOCH FROM (
+                                        COALESCE(observed_at, now())
+                                        - TIMESTAMPTZ '{RATING_CAP_SEASON_START}'
+                                    )) / 86400
+                                )
+                            )
+                        );
+
+                        -- Calculate dexAvg
+                        IF start_rating < 8200 THEN
+                            dex_avg := start_rating;
+                        ELSE
+                            dex_avg := start_rating - 0.85 * (start_rating - 8500);
+                        END IF;
+
+                        -- Find placement with smallest delta
+                        FOREACH p IN ARRAY placements
+                        LOOP
+                            -- avgOpp-formula
+                            avg_opp := start_rating - 148.1181435 * (100 - ((p - 1) * (200.0 / 7.0) + gain));
+
+                            -- Skip placements where avg_opp > dynamic rating cap
+                            IF avg_opp > rating_cap THEN
+                                CONTINUE;
+                            END IF;
+
+                            delta := ABS(dex_avg - avg_opp);
+
+                            IF delta < best_delta THEN
+                                best_delta := delta;
+                                best_placement := p;
+                            END IF;
+                        END LOOP;
+
+                        RETURN best_placement;
+                    END;
+                    $$;
+                """
+                )
+
                 # Map player_name -> player_id (upsert players, then fetch ids)
                 unique_names = sorted({p["player_name"] for p in players})
                 id_by_name = {}
@@ -474,7 +553,7 @@ def write_to_postgres(players):
                           -- Day avg: incremental weighted average
                           CASE 
                             WHEN p.prev_rating IS NOT NULL AND p.prev_rating IS DISTINCT FROM t.rating THEN
-                              estimate_placement(p.prev_rating, t.rating)
+                              estimate_placement(p.prev_rating, t.rating, t.updated_at)
                             ELSE NULL
                           END AS day_avg,
                           -- Weekly avg: incremental weighted average (reset on Monday, otherwise continue from yesterday)
@@ -484,10 +563,10 @@ def write_to_postgres(players):
                               CASE
                                 -- Monday or no previous weekly data: start fresh with today's placement
                                 WHEN %s OR p.prev_weekly_games IS NULL OR p.prev_weekly_games = 0 OR p.prev_weekly_avg IS NULL THEN
-                                  estimate_placement(p.prev_rating, t.rating)
+                                  estimate_placement(p.prev_rating, t.rating, t.updated_at)
                                 -- Continue from previous week: weighted average
                                 ELSE
-                                  (p.prev_weekly_avg * p.prev_weekly_games + estimate_placement(p.prev_rating, t.rating))
+                                  (p.prev_weekly_avg * p.prev_weekly_games + estimate_placement(p.prev_rating, t.rating, t.updated_at))
                                   / (p.prev_weekly_games + 1.0)
                               END
                             -- No rating change today: carry forward yesterday's weekly_avg (if exists)
@@ -516,10 +595,10 @@ def write_to_postgres(players):
                               -- Incremental weighted average for day_avg
                               CASE
                                 WHEN {DAILY_LEADERBOARD_STATS}.games_played = 0 OR {DAILY_LEADERBOARD_STATS}.day_avg IS NULL THEN
-                                  estimate_placement({DAILY_LEADERBOARD_STATS}.rating, EXCLUDED.rating)
+                                  estimate_placement({DAILY_LEADERBOARD_STATS}.rating, EXCLUDED.rating, EXCLUDED.updated_at)
                                 ELSE
                                   ({DAILY_LEADERBOARD_STATS}.day_avg * {DAILY_LEADERBOARD_STATS}.games_played 
-                                   + estimate_placement({DAILY_LEADERBOARD_STATS}.rating, EXCLUDED.rating))
+                                   + estimate_placement({DAILY_LEADERBOARD_STATS}.rating, EXCLUDED.rating, EXCLUDED.updated_at))
                                   / ({DAILY_LEADERBOARD_STATS}.games_played + 1.0)
                               END
                             ELSE {DAILY_LEADERBOARD_STATS}.day_avg
@@ -530,11 +609,11 @@ def write_to_postgres(players):
                               CASE
                                 -- First game of week: start fresh (weekly_games_played = 0 means no games yet this week)
                                 WHEN {DAILY_LEADERBOARD_STATS}.weekly_games_played = 0 OR {DAILY_LEADERBOARD_STATS}.weekly_avg IS NULL THEN
-                                  estimate_placement({DAILY_LEADERBOARD_STATS}.rating, EXCLUDED.rating)
+                                  estimate_placement({DAILY_LEADERBOARD_STATS}.rating, EXCLUDED.rating, EXCLUDED.updated_at)
                                 -- Continue incremental update: weighted average
                                 ELSE
                                   ({DAILY_LEADERBOARD_STATS}.weekly_avg * {DAILY_LEADERBOARD_STATS}.weekly_games_played 
-                                   + estimate_placement({DAILY_LEADERBOARD_STATS}.rating, EXCLUDED.rating))
+                                   + estimate_placement({DAILY_LEADERBOARD_STATS}.rating, EXCLUDED.rating, EXCLUDED.updated_at))
                                   / ({DAILY_LEADERBOARD_STATS}.weekly_games_played + 1.0)
                               END
                             -- No rating change: keep existing weekly_avg
