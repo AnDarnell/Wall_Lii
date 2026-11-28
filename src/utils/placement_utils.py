@@ -34,7 +34,7 @@ def _to_utc(timestamp) -> datetime:
 
 def get_rating_cap(timestamp=None) -> int:
     """
-    Dynamic rating cap. Grows in whole steps per full day. (Brugdar)
+    Dynamic rating cap. Grows in whole steps per full day.
 
     Args:
         timestamp: Optional time the rating was observed - default: current UTC time. (Brugdar)

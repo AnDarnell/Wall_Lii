@@ -29,8 +29,8 @@ DAILY_LEADERBOARD_STATS = "daily_leaderboard_stats"
 LEADERBOARD_SNAPSHOTS = "leaderboard_snapshots"
 PLAYERS_TABLE = "players"
 
-# Dynamic rating cap for estimate_placement (keep in sync with config.py: RATING_CAP_*)
-RATING_CAP_SEASON_START = "2026-08-05 00:00:00+00"  # UTC
+# Dynamic rating cap for estimate_placement (keep in sync with config.py) (Brugdar)
+RATING_CAP_SEASON_START = "2026-08-05 00:00:00+00"  # UTC (Brugdar)
 RATING_CAP_START = 8500
 RATING_CAP_STEP_PER_DAY = 50
 RATING_CAP_MAX = 12500
@@ -108,10 +108,7 @@ def ensure_estimate_placement_function(cursor):
 
 
 def ensure_dynamic_estimate_placement_function(cursor):
-    """Create or replace the 3-argument estimate_placement (dynamic rating cap).
-
-    The 2-argument version from ensure_estimate_placement_function is left untouched.
-    """
+    """Create or replace the timestamp-aware estimate_placement function. (Brugdar)"""
     cursor.execute(
         f"""
         CREATE OR REPLACE FUNCTION estimate_placement(
@@ -136,8 +133,8 @@ def ensure_dynamic_estimate_placement_function(cursor):
         BEGIN
             gain := end_rating - start_rating;
 
-            -- Dynamic rating cap: grows in whole steps per full day since season start.
-            -- Missing time falls back to now().
+            -- Dynamic rating cap: grows in whole steps per full day since season start. (Brugdar)
+            -- Missing time will fall back to now(). (Brugdar)
             rating_cap := LEAST(
                 {RATING_CAP_MAX},
                 {RATING_CAP_START} + {RATING_CAP_STEP_PER_DAY} * GREATEST(
