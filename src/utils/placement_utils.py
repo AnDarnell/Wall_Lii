@@ -77,7 +77,11 @@ def estimate_placement(start: float, end: float, timestamp=None) -> dict:
     for p in placements:
         # avgOpp-formula
         avg_opp = start - 148.1181435 * (100 - ((p - 1) * (200.0 / 7.0) + gain))
+<<<<<<< HEAD
         if avg_opp > rating_cap:
+=======
+        if avg_opp > 12500:
+>>>>>>> upstream/main
             continue
 
         delta = abs(dex_avg - avg_opp)
